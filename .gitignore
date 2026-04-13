@@ -1,0 +1,12 @@
+# Ignorer les binaires compilés par Cargo
+/target/
+
+# Ignorer les paquets Debian générés
+*.deb
+
+# Ignorer les fichiers temporaires
+*.log
+*.tmp
+
+# Ignorer la configuration locale (on garde seulement l'exemple)
+etc/vcpu-agent/config.toml

@@ -1,0 +1,11 @@
+[Unit]
+Description=Agent vCPU Balancer Rust (agent-vcpu)
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/agent-vcpu
+Restart=always
+User=root
+
+[Install]
+WantedBy=multi-user.target

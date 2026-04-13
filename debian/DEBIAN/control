@@ -1,0 +1,9 @@
+Package: agent-vcpu
+Version: 1.0
+Section: admin
+Priority: optional
+Architecture: amd64
+Depends: proxmox-ve
+Maintainer: Aurore
+Description: Agent Rust vCPU dynamique Grid-One Omega Fusion Core
+ Reconnaissance automatique par nom de VM ou ISO + rebalancing 1 vCPU.

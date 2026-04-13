@@ -1,0 +1,20 @@
+check_interval = 1
+window_seconds = 5
+
+[profiles.web]
+name_pattern = "web"
+iso_pattern = "2026.03.24"
+min = 2
+max = 8
+
+[profiles.desktop]
+name_pattern = "desktop"
+iso_pattern = "desktop"
+min = 1
+max = 4
+
+[profiles.omega]
+name_pattern = "omega"
+iso_pattern = "Omega1_GUI"
+min = 2
+max = 6
