@@ -3,8 +3,7 @@ use std::collections::HashMap;
 
 #[derive(Deserialize, Clone, Debug)]
 pub struct Profile {
-    pub name_pattern: String,
-    pub iso_pattern: String,
+    pub iso_pattern: String,   // Seul champ obligatoire maintenant
     pub min: u32,
     pub max: u32,
 }

@@ -14,3 +14,8 @@ pub fn log_message(msg: &str) {
         .unwrap();
     file.write_all(line.as_bytes()).unwrap();
 }
+
+// Nouvelle fonction pour logs de debug clairs
+pub fn log_debug(msg: &str) {
+    log_message(&format!("[DEBUG] {}", msg));
+}

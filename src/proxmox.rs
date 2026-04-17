@@ -15,10 +15,12 @@ pub fn get_all_vms() -> Vec<u32> {
         Some(o) => o,
         None => return vec![],
     };
+
     let vms: Vec<Value> = match serde_json::from_str(&out) {
         Ok(v) => v,
         Err(_) => return vec![],
     };
+
     vms.iter()
         .filter_map(|v| v["vmid"].as_u64().map(|id| id as u32))
         .collect()
@@ -63,4 +65,9 @@ pub fn get_iso_filename(vmid: u32) -> Option<String> {
         }
     }
     None
+}
+
+pub fn get_vm_ostype(vmid: u32) -> Option<String> {
+    let cfg = get_vm_config(vmid)?;
+    cfg["ostype"].as_str().map(|s| s.to_string())
 }
