@@ -2,172 +2,281 @@ use crate::config::{AppConfig, Profile};
 use crate::logger;
 use crate::proxmox::*;
 use crate::vm_recognizer::detect_profile;
-
 use std::collections::{HashMap, VecDeque};
 use std::thread;
 use std::time::Duration;
 
-// ─────────────────────────────
-// SEUILS
-// ─────────────────────────────
-const SEUIL_DETRESSE: f64 = 0.80;
-const SEUIL_RETOUR:   f64 = 0.30;
+// ─── État par VM ──────────────────────────────────────────────────────────────
 
-// ─────────────────────────────
-// FONCTION PRINCIPALE
-// ─────────────────────────────
+#[derive(Debug)]
+struct VMState {
+    history:          VecDeque<f64>,
+    distress_counter: u32,
+    donor_counter:    u32,
+}
+
+impl VMState {
+    fn new(capacity: usize) -> Self {
+        VMState {
+            history:          VecDeque::with_capacity(capacity),
+            distress_counter: 0,
+            donor_counter:    0,
+        }
+    }
+}
+
+// ─── Point d'entrée ───────────────────────────────────────────────────────────
+
 pub fn run(config: AppConfig) {
-    logger::log_message("=== Agent vCPU Balancer (version stable test) ===");
+    logger::log_message("=== Agent vCPU Balancer - Démarrage ===");
+    logger::log_message(&format!(
+        "Seuil détresse: {:.0}% | Seuil donneur: {:.0}% | Action après: {}s",
+        config.seuil_detresse * 100.0,
+        config.seuil_donneuse * 100.0,
+        config.duree_avant_action
+    ));
 
-    let mut history: HashMap<u32, VecDeque<f64>> = HashMap::new();
+    // vm_states : persist entre les cycles
+    let mut vm_states:    HashMap<u32, VMState> = HashMap::new();
+    // pending_loans[vmid] = nb vCPUs empruntés au-dessus du min
+    let mut pending_loans: HashMap<u32, u32>    = HashMap::new();
 
     loop {
         let vms = get_all_vms();
+        if vms.is_empty() {
+            logger::log_message("Aucune VM trouvée, nouvel essai dans 5s...");
+            thread::sleep(Duration::from_secs(5));
+            continue;
+        }
 
-        let mut distressed: Vec<(u32, Profile)> = vec![];
-        let mut donors: Vec<(u32, Profile)> = vec![];
+        // ── Étape 1 : Collecte ───────────────────────────────────────────────
+        let mut vm_profiles:     HashMap<u32, Profile> = HashMap::new();
+        let mut vm_avg_usage:    HashMap<u32, f64>     = HashMap::new();
+        let mut vm_current_vcpus: HashMap<u32, u32>   = HashMap::new();
 
-        // ─────────────────────────────
-        // 1. COLLECTE + ANALYSE
-        // ─────────────────────────────
         for &vmid in &vms {
             let name = match get_vm_name(vmid) {
                 Some(n) => n,
-                None => continue,
+                None    => continue,
             };
 
             let profile = match detect_profile(vmid, &name, &config.profiles) {
                 Some(p) => p,
-                None => continue,
+                None    => continue,
             };
 
-            let hist = history
+            let current_vcpus = get_current_vcpus(vmid).unwrap_or(profile.min);
+            vm_current_vcpus.insert(vmid, current_vcpus);
+            vm_profiles.insert(vmid, profile.clone());
+
+            // get_vm_cpu_usage retourne f64 directement (pas Option)
+            let usage = get_vm_cpu_usage(vmid);
+
+            let state = vm_states
                 .entry(vmid)
-                .or_insert_with(|| VecDeque::with_capacity(config.window_seconds));
+                .or_insert_with(|| VMState::new(config.window_seconds));
 
-            let status = match get_vm_status(vmid) {
-                Some(s) => s,
-                None => continue,
-            };
+            state.history.push_back(usage);
+            if state.history.len() > config.window_seconds {
+                state.history.pop_front();
+            }
 
-            let cpu_total = status["cpu"].as_f64().unwrap_or(0.0);
-            let current_vcpus = get_current_vcpus(vmid).unwrap_or(1);
+            if state.history.len() == config.window_seconds {
+                let avg = state.history.iter().sum::<f64>() / state.history.len() as f64;
+                vm_avg_usage.insert(vmid, avg);
 
-            let usage = if current_vcpus > 0 {
-                (cpu_total / current_vcpus as f64).clamp(0.0, 1.0)
+                logger::log_debug(&format!(
+                    "VM {} | vCPUs={} (min={}/max={}) | Moy={:.1}% | Prêts={}",
+                    vmid, current_vcpus, profile.min, profile.max,
+                    avg * 100.0,
+                    pending_loans.get(&vmid).unwrap_or(&0)
+                ));
+            }
+        }
+
+        // ── Étape 2 : Mise à jour des compteurs de ticks ─────────────────────
+        for (&vmid, &avg) in &vm_avg_usage {
+            let profile = &vm_profiles[&vmid];
+            let vcpus   = *vm_current_vcpus.get(&vmid).unwrap_or(&profile.min);
+            let state   = vm_states.get_mut(&vmid).unwrap();
+
+            if avg >= config.seuil_detresse && vcpus < profile.max {
+                state.distress_counter += 1;
+                state.donor_counter     = 0;
+            } else if avg <= config.seuil_donneuse && vcpus > profile.min {
+                state.donor_counter    += 1;
+                state.distress_counter  = 0;
             } else {
-                0.0
-            };
-
-            hist.push_back(usage);
-            if hist.len() > config.window_seconds {
-                hist.pop_front();
+                state.distress_counter = 0;
+                state.donor_counter    = 0;
             }
-
-            if hist.len() < config.window_seconds {
-                continue;
-            }
-
-            let avg = hist.iter().sum::<f64>() / hist.len() as f64;
 
             logger::log_debug(&format!(
-                "VM {} | vCPU={} | usage={:.1}%",
-                vmid,
-                current_vcpus,
-                avg * 100.0
+                "VM {} ticks → détresse={} | bas={}",
+                vmid, state.distress_counter, state.donor_counter
             ));
+        }
 
-            // 🔴 DETRESSE
-            if avg > SEUIL_DETRESSE && current_vcpus < profile.max as u32 {
-                distressed.push((vmid, profile.clone()));
+        // ── Étape 3 : Remboursements (priorité sur les prêts) ─────────────────
+        for (&vmid, &loaned) in &pending_loans.clone() {
+            if loaned == 0 { continue; }
 
-                logger::log_message(&format!(
-                    "🚨 VM {} en DETRESSE ({:.1}%)",
-                    vmid, avg * 100.0
-                ));
-            }
+            let donor_ticks = match vm_states.get(&vmid) {
+                Some(s) => s.donor_counter,
+                None    => continue,
+            };
+            if (donor_ticks as usize) < config.duree_avant_action { continue; }
 
-            // 🟢 DONNEUSE
-            if avg < SEUIL_RETOUR && current_vcpus > profile.min as u32 {
-                donors.push((vmid, profile.clone()));
+            let vcpus   = *vm_current_vcpus.get(&vmid).unwrap_or(&0);
+            let profile = match vm_profiles.get(&vmid) {
+                Some(p) => p,
+                None    => continue,
+            };
 
-                logger::log_message(&format!(
-                    "💚 VM {} sous-utilisée ({:.1}%)",
-                    vmid, avg * 100.0
-                ));
+            if vcpus > profile.min {
+                let new_vcpus = vcpus - 1;
+                if set_vm_vcpus(vmid, new_vcpus).is_some() {
+                    vm_current_vcpus.insert(vmid, new_vcpus);
+                    let entry = pending_loans.entry(vmid).or_insert(0);
+                    if *entry > 0 { *entry -= 1; }
+                    vm_states.get_mut(&vmid).unwrap().donor_counter = 0;
+                    logger::log_message(&format!(
+                        "✅ REMBOURSEMENT: VM {} → {} vCPUs (prêts restants: {})",
+                        vmid, new_vcpus, pending_loans[&vmid]
+                    ));
+                } else {
+                    logger::log_message(&format!("❌ Échec remboursement VM {}", vmid));
+                }
+            } else {
+                // Plus rien à rendre, on nettoie
+                pending_loans.remove(&vmid);
             }
         }
 
-        // ─────────────────────────────
-        // 2. RESTITUTION (PRIORITAIRE)
-        // ─────────────────────────────
-        for (vmid, profile) in &donors {
-            let current = get_current_vcpus(*vmid).unwrap_or(0);
+        // ── Étape 4 : Prêts ───────────────────────────────────────────────────
+        // VMs en détresse ayant atteint le seuil de ticks, triées par usage décroissant
+        let mut distress_vms: Vec<(u32, f64)> = vm_avg_usage
+            .iter()
+            .filter(|(&vmid, &avg)| {
+                let profile = &vm_profiles[&vmid];
+                let vcpus   = *vm_current_vcpus.get(&vmid).unwrap_or(&profile.min);
+                let ticks   = vm_states[&vmid].distress_counter as usize;
+                avg >= config.seuil_detresse
+                    && vcpus < profile.max
+                    && ticks >= config.duree_avant_action
+            })
+            .map(|(&id, &avg)| (id, avg))
+            .collect();
 
-            if current > profile.min as u32 {
-                let new_vcpus = current - 1;
+        distress_vms.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
 
+        for (distress_vmid, distress_avg) in &distress_vms {
+            let profile_d = &vm_profiles[distress_vmid];
+            let vcpus_d   = *vm_current_vcpus.get(distress_vmid).unwrap();
+
+            if vcpus_d >= profile_d.max {
                 logger::log_message(&format!(
-                    "🔻 VM {} rend 1 vCPU ({} → {})",
-                    vmid, current, new_vcpus
+                    "⚠️ VM {} au plafond ({}/{}) — surcharge acceptée ({:.1}%)",
+                    distress_vmid, vcpus_d, profile_d.max, distress_avg * 100.0
                 ));
-
-                apply_vcpus(*vmid, new_vcpus);
-
-                // ⚠️ on ne rend qu'un seul par cycle
-                break;
-            }
-        }
-
-        // ─────────────────────────────
-        // 3. REBALANCING (EMPRUNT)
-        // ─────────────────────────────
-        let mut transfers = 0;
-        let max_transfers = 2;
-
-        while !distressed.is_empty() && transfers < max_transfers {
-
-            let (d_vm, d_profile) = distressed.remove(0);
-
-            let d_current = get_current_vcpus(d_vm).unwrap_or(0);
-
-            if d_current >= d_profile.max as u32 {
                 continue;
             }
 
-            // chercher un donneur
-            if let Some((donor_vm, donor_profile)) = donors.pop() {
+            // Chercher le donneur avec l'usage le plus faible, ticks suffisants
+            // On relit vm_current_vcpus qui est mis à jour à chaque prêt
+            let donor = vm_current_vcpus
+                .iter()
+                .filter(|(&id, &vcpus)| {
+                    if id == *distress_vmid { return false; }
+                    let p   = match vm_profiles.get(&id) { Some(p) => p, None => return false };
+                    let avg = vm_avg_usage.get(&id).copied().unwrap_or(1.0);
+                    let ticks = vm_states
+                        .get(&id)
+                        .map(|s| s.donor_counter as usize)
+                        .unwrap_or(0);
+                    vcpus > p.min
+                        && avg <= config.seuil_donneuse
+                        && ticks >= config.duree_avant_action
+                })
+                .min_by(|a, b| {
+                    let avg_a = vm_avg_usage.get(a.0).copied().unwrap_or(1.0);
+                    let avg_b = vm_avg_usage.get(b.0).copied().unwrap_or(1.0);
+                    avg_a.partial_cmp(&avg_b).unwrap()
+                })
+                .map(|(&id, _)| id);
 
-                let donor_current = get_current_vcpus(donor_vm).unwrap_or(0);
+            if let Some(donor_id) = donor {
+                let donor_vcpus  = *vm_current_vcpus.get(&donor_id).unwrap();
+                let new_donor    = donor_vcpus - 1;
+                let new_distress = vcpus_d + 1;
 
-                if donor_current > donor_profile.min as u32 {
+                logger::log_message(&format!(
+                    "🔄 PRÊT: VM {} ({:.1}%) donne 1 vCPU → VM {} ({:.1}%)",
+                    donor_id,
+                    vm_avg_usage.get(&donor_id).copied().unwrap_or(0.0) * 100.0,
+                    distress_vmid,
+                    distress_avg * 100.0
+                ));
 
-                    let new_donor = donor_current - 1;
-                    let new_d = d_current + 1;
+                let ok_donor    = set_vm_vcpus(donor_id, new_donor).is_some();
+                let ok_distress = set_vm_vcpus(*distress_vmid, new_distress).is_some();
 
+                if ok_donor && ok_distress {
+                    // Mise à jour locale immédiate — évite double prêt dans le même cycle
+                    vm_current_vcpus.insert(donor_id, new_donor);
+                    vm_current_vcpus.insert(*distress_vmid, new_distress);
+                    *pending_loans.entry(*distress_vmid).or_insert(0) += 1;
+                    vm_states.get_mut(&donor_id).unwrap().donor_counter     = 0;
+                    vm_states.get_mut(distress_vmid).unwrap().distress_counter = 0;
                     logger::log_message(&format!(
-                        "🔄 TRANSFERT: VM{} ({}→{}) → VM{} ({}→{})",
-                        donor_vm, donor_current, new_donor,
-                        d_vm, d_current, new_d
+                        "✅ PRÊT OK: VM {}→{} vCPUs | VM {}→{} vCPUs | prêts VM {}: {}",
+                        donor_id, new_donor,
+                        distress_vmid, new_distress,
+                        distress_vmid, pending_loans[distress_vmid]
                     ));
+                } else {
+                    // Rollback si l'une des deux a échoué
+                    if ok_donor && !ok_distress {
+                        let _ = set_vm_vcpus(donor_id, donor_vcpus);
+                        logger::log_message(&format!("↩️ Rollback donneur VM {}", donor_id));
+                    }
+                    logger::log_message(&format!(
+                        "❌ Échec prêt VM {} → VM {}",
+                        donor_id, distress_vmid
+                    ));
+                }
+            } else {
+                // Aucun donneur VM → essayer overcommit hôte
+                let host_cpus: u32 = run_command("nproc")
+                    .and_then(|s| s.trim().parse().ok())
+                    .unwrap_or(1);
+                let total_vcpus: u32 = vm_current_vcpus.values().sum();
+                let max_allowed = (host_cpus as f64 * config.cpu_overcommit_ratio) as u32;
 
-                    apply_vcpus(donor_vm, new_donor);
-                    apply_vcpus(d_vm, new_d);
-
-                    transfers += 1;
-
-                    thread::sleep(Duration::from_secs(1));
+                if total_vcpus < max_allowed {
+                    let new_distress = vcpus_d + 1;
+                    if set_vm_vcpus(*distress_vmid, new_distress).is_some() {
+                        vm_current_vcpus.insert(*distress_vmid, new_distress);
+                        *pending_loans.entry(*distress_vmid).or_insert(0) += 1;
+                        vm_states.get_mut(distress_vmid).unwrap().distress_counter = 0;
+                        logger::log_message(&format!(
+                            "✅ PRÊT HÔTE: VM {} → {} vCPUs [{}/{}]",
+                            distress_vmid, new_distress, total_vcpus + 1, max_allowed
+                        ));
+                    } else {
+                        logger::log_message(&format!(
+                            "❌ Échec prêt hôte pour VM {}", distress_vmid
+                        ));
+                    }
+                } else {
+                    logger::log_message(&format!(
+                        "⚠️ VM {} en détresse, ratio hôte atteint ({}/{}), surcharge acceptée",
+                        distress_vmid, total_vcpus, max_allowed
+                    ));
                 }
             }
         }
 
         thread::sleep(Duration::from_secs(config.check_interval));
     }
-}
-
-// ─────────────────────────────
-// APPLIQUER VCPU (simple)
-// ─────────────────────────────
-fn apply_vcpus(vmid: u32, target: u32) {
-    let _ = run_command(&format!("qm set {} --vcpus {}", vmid, target));
 }
