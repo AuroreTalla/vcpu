@@ -141,7 +141,7 @@ fn get_vm_cpu_proc(vmid: u32) -> f64 {
     };
 
     let (p1, t1) = match read_snapshot() { Some(v) => v, None => return 0.0 };
-    std::thread::sleep(std::time::Duration::from_secs(1));
+    std::thread::sleep(std::time::Duration::from_millis(500));
     let (p2, t2) = match read_snapshot() { Some(v) => v, None => return 0.0 };
 
     let delta_proc = p2.saturating_sub(p1) as f64;

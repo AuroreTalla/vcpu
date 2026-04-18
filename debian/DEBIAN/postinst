@@ -1,0 +1,10 @@
+#!/bin/bash
+set -e
+mkdir -p /etc/vcpu-agent
+if [ ! -f /etc/vcpu-agent/config.toml ]; then
+    cp /etc/vcpu-agent/config.toml.example /etc/vcpu-agent/config.toml
+    echo "Config installée dans /etc/vcpu-agent/config.toml — éditez avant de démarrer"
+fi
+systemctl daemon-reload
+systemctl enable agent-vcpu.service
+systemctl restart agent-vcpu.service
