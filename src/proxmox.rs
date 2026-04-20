@@ -1,6 +1,5 @@
 use serde_json::Value;
 use std::process::Command;
-use crate::logger;
 
 pub fn run_command(cmd: &str) -> Option<String> {
     let output = Command::new("sh").arg("-c").arg(cmd).output().ok()?;
@@ -88,17 +87,9 @@ pub fn get_vm_cpu_usage(vmid: u32) -> f64 {
             let cpu_raw = val["cpu"].as_f64().unwrap_or(0.0);
             let maxcpu = val["cpus"].as_f64().unwrap_or(1.0);
 
-            logger::log_debug(&format!(
-                "VM {} pvesh → cpu={:.4} cpus={:.0}",
-                vmid, cpu_raw, maxcpu
-            ));
-
             if cpu_raw > 0.005 {
                 let usage = cpu_raw / maxcpu;   // valeur correcte (peut dépasser 1.0)
-                logger::log_debug(&format!(
-                    "VM {} usage PRODUCTION → {:.1}%",
-                    vmid, usage * 100.0
-                ));
+                
                 return usage;
             }
         }
@@ -156,11 +147,6 @@ fn get_vm_cpu_proc(vmid: u32) -> f64 {
     // Calcul précis sans limiter à 100%
     let usage = delta_proc / delta_total * host_cpus / vcpus;
 
-    logger::log_debug(&format!(
-        "VM {} /proc (ALL threads) → proc={:.0} total={:.0} host={:.0} vcpus={:.0} = {:.1}%",
-        vmid, delta_proc, delta_total, host_cpus, vcpus, usage * 100.0
-    ));
-
     usage
 }
 
@@ -183,6 +169,5 @@ pub fn get_host_cpus() -> u32 {
 
 pub fn set_vm_vcpus(vmid: u32, vcpus: u32) -> Option<String> {
     let cmd = format!("qm set {} --vcpus {}", vmid, vcpus);
-    logger::log_debug(&format!("CMD: qm set {} --vcpus {}", vmid, vcpus));
     run_command(&cmd)
 }
