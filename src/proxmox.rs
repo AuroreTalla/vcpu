@@ -26,13 +26,21 @@ pub fn get_all_vms() -> Vec<u32> {
 
 pub fn get_vm_config(vmid: u32) -> Option<Value> {
     let cmd = format!("pvesh get /nodes/localhost/qemu/{}/config --output-format=json", vmid);
-    let out = run_command(&cmd)?;
-    serde_json::from_str(&out).ok()
+    serde_json::from_str(&run_command(&cmd)?).ok()
 }
 
 pub fn get_current_vcpus(vmid: u32) -> Option<u32> {
     let cfg = get_vm_config(vmid)?;
     cfg["vcpus"].as_u64().map(|v| v as u32)
+}
+
+// Nombre max de vCPUs utilisables = cores × sockets
+// C'est le plafond hardware — on ne peut pas dépasser ça avec hotplug
+pub fn get_vm_cores_max(vmid: u32) -> u32 {
+    let cfg = match get_vm_config(vmid) { Some(c) => c, None => return 1 };
+    let cores   = cfg["cores"].as_u64().unwrap_or(1) as u32;
+    let sockets = cfg["sockets"].as_u64().unwrap_or(1) as u32;
+    cores * sockets
 }
 
 pub fn get_vm_name(vmid: u32) -> Option<String> {
@@ -76,13 +84,8 @@ pub fn get_vm_pid(vmid: u32) -> Option<u32> {
 }
 
 // ── Tag opt-in ────────────────────────────────────────────────────────────────
-// Sans aucun tag sur aucune VM → toutes incluses (comportement par défaut)
-// Dès qu'une VM a le tag "vcpu-agent" → seules les VMs taguées participent
 pub fn vm_has_agent_tag(vmid: u32) -> bool {
-    let cfg = match get_vm_config(vmid) {
-        Some(c) => c,
-        None    => return false,
-    };
+    let cfg = match get_vm_config(vmid) { Some(c) => c, None => return false };
     match cfg["tags"].as_str() {
         None       => true,
         Some("")   => true,
@@ -90,109 +93,85 @@ pub fn vm_has_agent_tag(vmid: u32) -> bool {
     }
 }
 
-// ── Mesure CPU — 3 niveaux de priorité ───────────────────────────────────────
+// ── Mesure CPU ────────────────────────────────────────────────────────────────
+// Priorité 1 : agent QEMU (mesure depuis l'intérieur de la VM)
+// Priorité 2 : pvesh (production bare-metal sans agent)
+// Priorité 3 : /proc via l'hôte (nested virt sans agent)
 pub fn get_vm_cpu_usage(vmid: u32) -> f64 {
-    // PRIORITÉ 1 : QEMU Guest Agent — précis, fonctionne en nested ET production
-    if let Some(usage) = get_vm_cpu_via_agent(vmid) {
-        return usage;
-    }
+    if let Some(u) = get_vm_cpu_via_agent(vmid) { return u; }
 
-    // PRIORITÉ 2 : pvesh — production bare-metal sans agent installé
     let cmd = format!(
-        "pvesh get /nodes/localhost/qemu/{}/status/current --output-format=json",
-        vmid
+        "pvesh get /nodes/localhost/qemu/{}/status/current --output-format=json", vmid
     );
     if let Some(out) = run_command(&cmd) {
         if let Ok(val) = serde_json::from_str::<Value>(&out) {
             let cpu = val["cpu"].as_f64().unwrap_or(0.0);
-            if cpu > 0.005 {
-                return cpu.clamp(0.0, 1.0);
-            }
+            if cpu > 0.005 { return cpu.clamp(0.0, 1.0); }
         }
     }
 
-    // PRIORITÉ 3 : /proc via l'hôte — nested virt sans agent
     get_vm_cpu_proc(vmid)
 }
 
-// Lecture CPU via QEMU Guest Agent
-// Lit /proc/stat depuis l'intérieur de la VM → mesure exacte indépendante de l'hôte
+// Mesure via agent QEMU — UN SEUL appel shell qui fait le delta en interne
+// Le script shell lit /proc/stat deux fois avec 400ms d'écart et calcule l'usage
+// → 1 appel réseau au lieu de 2, résultat direct en pourcentage
 fn get_vm_cpu_via_agent(vmid: u32) -> Option<f64> {
-    let snap1 = get_agent_cpu_snapshot(vmid)?;
-    std::thread::sleep(std::time::Duration::from_millis(300));
-    let snap2 = get_agent_cpu_snapshot(vmid)?;
+    // Script shell embarqué qui calcule le delta CPU directement dans la VM
+    let script = r#"
+s1=$(cat /proc/stat | head -1 | awk '{u=$2+$4; t=$2+$3+$4+$5+$6+$7+$8; print u " " t}');
+sleep 0.4;
+s2=$(cat /proc/stat | head -1 | awk '{u=$2+$4; t=$2+$3+$4+$5+$6+$7+$8; print u " " t}');
+u1=$(echo $s1 | cut -d' ' -f1); t1=$(echo $s1 | cut -d' ' -f2);
+u2=$(echo $s2 | cut -d' ' -f1); t2=$(echo $s2 | cut -d' ' -f2);
+dt=$((t2-t1)); du=$((u2-u1));
+if [ $dt -gt 0 ]; then echo "$du $dt"; else echo "0 1"; fi
+"#;
 
-    let delta_used  = snap2.0.saturating_sub(snap1.0) as f64;
-    let delta_total = snap2.1.saturating_sub(snap1.1) as f64;
-
-    if delta_total == 0.0 { return None; }
-
-    // delta_used/delta_total = fraction du temps CPU utilisée dans la VM
-    // déjà normalisé par rapport aux vCPUs de la VM, pas besoin de l'hôte
-    Some((delta_used / delta_total).clamp(0.0, 1.0))
-}
-
-// Snapshot (used_ticks, total_ticks) via qm guest exec → /proc/stat de la VM
-fn get_agent_cpu_snapshot(vmid: u32) -> Option<(u64, u64)> {
     let cmd = format!(
-        "qm guest exec {} -- sh -c 'cat /proc/stat' 2>/dev/null",
-        vmid
+        "qm guest exec {} -- sh -c '{}' 2>/dev/null",
+        vmid,
+        script.replace('\n', " ").trim()
     );
-    let out = run_command(&cmd)?;
 
-    // qm guest exec retourne du JSON :
-    // {"exitcode":0,"out-data":"cpu  1234 0 567 8910 ...\n","err-data":""}
-    // OU si async : {"pid":123} → nécessite un poll
+    let out = run_command(&cmd)?;
     let val: Value = serde_json::from_str(&out).ok()?;
 
-    let line = if let Some(data) = val["out-data"].as_str() {
-        // Réponse synchrone directe
-        data.lines().next()?.to_string()
+    // Gérer réponse synchrone et asynchrone
+    let data = if let Some(d) = val["out-data"].as_str() {
+        d.trim().to_string()
     } else if let Some(pid) = val["pid"].as_u64() {
-        // Réponse asynchrone → poll du résultat
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        std::thread::sleep(std::time::Duration::from_millis(600));
         let poll = format!("qm guest exec-status {} {} 2>/dev/null", vmid, pid);
         let poll_out = run_command(&poll)?;
         let poll_val: Value = serde_json::from_str(&poll_out).ok()?;
-        poll_val["out-data"].as_str()?.lines().next()?.to_string()
+        poll_val["out-data"].as_str()?.trim().to_string()
     } else {
         return None;
     };
 
-    // Parser "cpu  user nice system idle iowait irq softirq steal guest guest_nice"
-    let fields: Vec<u64> = line
-        .split_whitespace()
-        .skip(1) // sauter le mot "cpu"
+    // Résultat attendu : "du dt" (delta_used delta_total)
+    let parts: Vec<u64> = data.split_whitespace()
         .filter_map(|s| s.parse().ok())
         .collect();
 
-    if fields.len() < 4 { return None; }
+    if parts.len() < 2 || parts[1] == 0 { return None; }
 
-    let idle   = fields[3];
-    let iowait = fields.get(4).copied().unwrap_or(0);
-    let total: u64 = fields.iter().sum();
-    let used   = total.saturating_sub(idle).saturating_sub(iowait);
-
-    Some((used, total))
+    let usage = (parts[0] as f64 / parts[1] as f64).clamp(0.0, 1.0);
+    Some(usage)
 }
 
-// Fallback /proc via l'hôte — utilisé uniquement si agent indisponible
+// Fallback /proc via l'hôte — nested virt sans agent
 fn get_vm_cpu_proc(vmid: u32) -> f64 {
-    let pid = match get_vm_pid(vmid) {
-        Some(p) => p,
-        None    => return 0.0,
-    };
+    let pid = match get_vm_pid(vmid) { Some(p) => p, None => return 0.0 };
 
     let snapshot = |p: u32| -> Option<(u64, u64)> {
-        let mut proc_ticks: u64 = 0;
-        let task_dir = format!("/proc/{}/task", p);
-        if let Ok(entries) = std::fs::read_dir(&task_dir) {
-            for entry in entries.filter_map(Result::ok) {
-                if let Ok(tid) = entry.file_name().to_string_lossy().parse::<u32>() {
+        let mut ticks: u64 = 0;
+        if let Ok(entries) = std::fs::read_dir(format!("/proc/{}/task", p)) {
+            for e in entries.filter_map(Result::ok) {
+                if let Ok(tid) = e.file_name().to_string_lossy().parse::<u32>() {
                     let path = format!("/proc/{}/task/{}/stat", p, tid);
-                    if let Some(t) = read_single_thread_ticks(&path) {
-                        proc_ticks += t;
-                    }
+                    if let Some(t) = read_thread_ticks(&path) { ticks += t; }
                 }
             }
         }
@@ -200,11 +179,11 @@ fn get_vm_cpu_proc(vmid: u32) -> f64 {
         let total: u64 = stat.lines().next()?
             .split_whitespace().skip(1)
             .filter_map(|s| s.parse::<u64>().ok()).sum();
-        Some((proc_ticks, total))
+        Some((ticks, total))
     };
 
     let (p1, t1) = match snapshot(pid) { Some(v) => v, None => return 0.0 };
-    std::thread::sleep(std::time::Duration::from_millis(300));
+    std::thread::sleep(std::time::Duration::from_millis(400));
     let (p2, t2) = match snapshot(pid) { Some(v) => v, None => return 0.0 };
 
     let dp = p2.saturating_sub(p1) as f64;
@@ -213,26 +192,22 @@ fn get_vm_cpu_proc(vmid: u32) -> f64 {
 
     let host_cpus = get_host_cpus() as f64;
     let vcpus     = get_current_vcpus(vmid).unwrap_or(1) as f64;
-
     (dp / dt * host_cpus / vcpus).clamp(0.0, 2.0)
 }
 
-fn read_single_thread_ticks(stat_path: &str) -> Option<u64> {
-    let stat   = std::fs::read_to_string(stat_path).ok()?;
+fn read_thread_ticks(path: &str) -> Option<u64> {
+    let stat   = std::fs::read_to_string(path).ok()?;
     let fields: Vec<&str> = stat.split_whitespace().collect();
     if fields.len() < 15 { return None; }
-    let utime: u64 = fields[13].parse().ok()?;
-    let stime: u64 = fields[14].parse().ok()?;
-    Some(utime + stime)
+    let u: u64 = fields[13].parse().ok()?;
+    let s: u64 = fields[14].parse().ok()?;
+    Some(u + s)
 }
 
 pub fn get_host_cpus() -> u32 {
-    run_command("nproc")
-        .and_then(|s| s.trim().parse::<u32>().ok())
-        .unwrap_or(1)
+    run_command("nproc").and_then(|s| s.trim().parse().ok()).unwrap_or(1)
 }
 
 pub fn set_vm_vcpus(vmid: u32, vcpus: u32) -> Option<String> {
-    let cmd = format!("qm set {} --vcpus {}", vmid, vcpus);
-    run_command(&cmd)
+    run_command(&format!("qm set {} --vcpus {}", vmid, vcpus))
 }
