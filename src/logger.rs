@@ -10,7 +10,3 @@ pub fn log_message(msg: &str) {
         let _ = f.write_all(line.as_bytes());
     }
 }
-
-pub fn log_debug(msg: &str) {
-    log_message(&format!("[DEBUG] {}", msg));
-}

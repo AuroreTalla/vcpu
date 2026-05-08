@@ -32,12 +32,11 @@ impl VMState {
 }
 
 // ─── Prêt actif ───────────────────────────────────────────────────────────────
-// Mémorise l'état initial de l'emprunteur pour savoir où revenir
 #[derive(Debug, Clone)]
 struct Loan {
     preteur_id:    u32,  // 0 = hôte
-    nb_empruntes:  u32,  // nombre de vCPUs empruntés
-    vcpus_initial: u32,  // vCPUs de l'emprunteur AVANT le premier prêt
+    nb_empruntes:  u32,  // vCPUs actuellement empruntés
+    vcpus_initial: u32,  // vCPUs de l'emprunteur AVANT le 1er prêt → cible du retour
 }
 
 // ─── Mesure parallèle ────────────────────────────────────────────────────────
@@ -91,15 +90,15 @@ fn log_etat(
 
         let pret_str = if nb_emp > 0 {
             let init = loan.map(|l| l.vcpus_initial).unwrap_or(vcpus);
-            let p    = loan.map(|l| l.preteur_id).unwrap_or(0);
-            let dest = if p == 0 { "l'hôte".to_string() } else { format!("VM {}", p) };
-            format!(" [doit rendre {} vCPU(s) à {} | état initial: {}]", nb_emp, dest, init)
+            let pid  = loan.map(|l| l.preteur_id).unwrap_or(0);
+            let dest = if pid == 0 { "l'hôte".to_string() } else { format!("VM {}", pid) };
+            format!(" [doit rendre {} à {} | retour cible: {} vCPUs]", nb_emp, dest, init)
         } else { String::new() };
 
         let tick_str = if state.distress_counter > 0 {
-            format!("détresse depuis {}c", state.distress_counter)
+            format!("détresse {}c", state.distress_counter)
         } else if state.low_counter > 0 {
-            format!("repos depuis {}c", state.low_counter)
+            format!("repos {}c", state.low_counter)
         } else { "stable".to_string() };
 
         logger::log_message(&format!(
@@ -123,21 +122,19 @@ pub fn run(config: AppConfig) {
     ));
 
     let mut vm_states: HashMap<u32, VMState> = HashMap::new();
-    // loans[emprunteur_id] = Loan { preteur, nb_empruntes, vcpus_initial }
-    let mut loans: HashMap<u32, Loan> = HashMap::new();
+    let mut loans:     HashMap<u32, Loan>    = HashMap::new();
 
     loop {
-        // ── 0 : Lister VMs actives avec tag ──────────────────────────────────
+        // ── 0 : Lister VMs éligibles ─────────────────────────────────────────
         let all = get_all_vms();
         if all.is_empty() {
             logger::log_message("⚠️  Aucune VM, retry dans 5s...");
-            thread::sleep(Duration::from_secs(5));
+            thread::sleep(Duration::from_millis(300));
             continue;
         }
 
-        let mut profiles:  HashMap<u32, Profile> = HashMap::new();
-        let mut actifs:    Vec<u32>              = Vec::new();
-
+        let mut profiles: HashMap<u32, Profile> = HashMap::new();
+        let mut actifs:   Vec<u32>              = Vec::new();
         for &vmid in &all {
             if !vm_has_agent_tag(vmid) { continue; }
             let name = match get_vm_name(vmid) { Some(n) => n, None => continue };
@@ -146,14 +143,13 @@ pub fn run(config: AppConfig) {
                 actifs.push(vmid);
             }
         }
-
         if actifs.is_empty() {
-            thread::sleep(Duration::from_secs(config.check_interval));
+            thread::sleep(Duration::from_millis(300));
             continue;
         }
 
         // ── 1 : Mesures PARALLÈLES ────────────────────────────────────────────
-        // Toutes les VMs mesurées simultanément → durée = 1 mesure (~500ms)
+        // Toutes les VMs mesurées en même temps → durée = 1 mesure (~500ms)
         let metriques = mesurer_toutes_vms(&actifs, &profiles);
 
         // ── 2 : Historique et moyennes ────────────────────────────────────────
@@ -163,7 +159,8 @@ pub fn run(config: AppConfig) {
         for m in &metriques {
             if profiles.get(&m.vmid).is_none() { continue; }
             vcpus_m.insert(m.vmid, m.vcpus);
-            let s = vm_states.entry(m.vmid).or_insert_with(|| VMState::new(config.window_seconds));
+            let s = vm_states.entry(m.vmid)
+                .or_insert_with(|| VMState::new(config.window_seconds));
             s.push(m.usage, config.window_seconds);
             if s.full(config.window_seconds) {
                 if let Some(avg) = s.avg() { vm_avg.insert(m.vmid, avg); }
@@ -171,7 +168,7 @@ pub fn run(config: AppConfig) {
         }
 
         if vm_avg.is_empty() {
-            thread::sleep(Duration::from_secs(config.check_interval));
+            thread::sleep(Duration::from_millis(300));
             continue;
         }
 
@@ -181,136 +178,106 @@ pub fn run(config: AppConfig) {
             let vcpus    = *vcpus_m.get(&vmid).unwrap_or(&profile.min);
             let has_loan = loans.contains_key(&vmid);
             let state    = vm_states.get_mut(&vmid).unwrap();
+	    let seuil_remboursement = config.seuil_donneuse + 0.10; // +10%
 
-            if avg >= config.seuil_detresse && vcpus < profile.max {
-                // En détresse et peut encore recevoir
+
+            if avg < 0.20 {
+ 		   state.low_counter = config.duree_avant_action as u32;
+            } else if avg >= config.seuil_detresse && vcpus < profile.max {
                 state.distress_counter += 1;
                 state.low_counter       = 0;
-            } else if avg <= config.seuil_donneuse && (has_loan || vcpus > profile.min) {
-                // En repos — et soit a un prêt à rembourser, soit au-dessus du min
+            } else if avg <= seuil_remboursement && (has_loan || vcpus > profile.min) {
+                // En repos : peut rembourser si a un prêt, ou libérer si au-dessus du min
                 state.low_counter      += 1;
                 state.distress_counter  = 0;
             } else {
-                // Saturée ou normal — reset les deux
                 state.distress_counter = 0;
-                state.low_counter      = 0;
-            }
-        }
+                if state.low_counter > 0 {
+			state.low_counter -= 1;
+                }
+	    }
+         }
 
-        // ── Affichage état — une fois par cycle ───────────────────────────────
+        // ── Affichage état ────────────────────────────────────────────────────
         log_etat(&vm_avg, &profiles, &vcpus_m, &vm_states, &loans,
                  config.seuil_detresse, config.seuil_donneuse);
 
         // ── 4 : Remboursements ────────────────────────────────────────────────
-        // Rembourser 1 vCPU par cycle si en repos depuis N cycles
-        // S'arrêter quand vcpus == vcpus_initial (état avant le prêt)
-        for (&emp_id, loan) in &loans.clone() {
+        // Rembourser dès que repos >= duree_avant_action
+        // Retour VERS l'état initial (vcpus_initial), pas vers profile.min
+        let loan_ids: Vec<u32> = loans.keys().cloned().collect();
+        for emp_id in loan_ids {
+            let loan = match loans.get(&emp_id) { Some(l) => l.clone(), None => continue };
             if loan.nb_empruntes == 0 { loans.remove(&emp_id); continue; }
 
             let low = vm_states.get(&emp_id).map(|s| s.low_counter).unwrap_or(0) as usize;
             if low < config.duree_avant_action { continue; }
 
             let vcpus_emp = *vcpus_m.get(&emp_id).unwrap_or(&0);
-            let vcpus_cible = loan.vcpus_initial; // revenir à l'état initial, pas au min
-
-            if vcpus_emp <= vcpus_cible {
-                // Déjà à l'état initial, solder le prêt
+            if vcpus_emp <= loan.vcpus_initial {
+                // Déjà revenue à l'état initial
                 loans.remove(&emp_id);
                 logger::log_message(&format!(
-                    "ℹ️  VM {} revenue à son état initial ({} vCPUs) — prêt soldé", emp_id, vcpus_emp
+                    "✅ VM {} revenue à son état initial ({} vCPUs)", emp_id, vcpus_emp
                 ));
                 continue;
             }
-
+            // Rembourser 1 vCPU
             let new_emp = vcpus_emp - 1;
             let pret_id = loan.preteur_id;
 
+            let ok_emp = set_vm_vcpus(emp_id, new_emp).is_some();
+
             if pret_id == 0 {
                 // Prêt hôte : libérer sans rendre
-                if set_vm_vcpus(emp_id, new_emp).is_some() {
-                    vcpus_m.insert(emp_id, new_emp);
-                    if let Some(l) = loans.get_mut(&emp_id) {
-                        l.nb_empruntes -= 1;
-                        if l.nb_empruntes == 0 { loans.remove(&emp_id); }
-                    }
-                    vm_states.get_mut(&emp_id).unwrap().low_counter = 0;
+                true
+            } else {
+                let vcpus_pret   = *vcpus_m.get(&pret_id).unwrap_or(&0);
+                let profile_pret = profiles.get(&pret_id);
+                let max_pret     = profile_pret.map(|p| p.max).unwrap_or(u32::MAX);
+                let new_pret     = vcpus_pret + 1;
+                if new_pret <= max_pret {
+                    let ok = set_vm_vcpus(pret_id, new_pret).is_some();
+                    if ok { vcpus_m.insert(pret_id, new_pret); }
+                    ok
+                } else {
+                    // Prêteuse au max — libérer quand même sans lui rendre
+                    true
+                }
+            };
+
+            if ok_emp {
+                vcpus_m.insert(emp_id, new_emp);
+                if let Some(l) = loans.get_mut(&emp_id) {
+                    if l.nb_empruntes > 0 { l.nb_empruntes -= 1; }
+                    if l.nb_empruntes == 0 { loans.remove(&emp_id); }
+                }
+                vm_states.get_mut(&emp_id).unwrap().low_counter = 0;
+                let reste = loans.get(&emp_id).map(|l| l.nb_empruntes).unwrap_or(0);
+                if pret_id == 0 {
                     logger::log_message(&format!(
-                        "↩️  RETOUR HÔTE : VM {} {} → {} vCPUs | reste: {}",
-                        emp_id, vcpus_emp, new_emp,
-                        loans.get(&emp_id).map(|l| l.nb_empruntes).unwrap_or(0)
+                        "↩️  RETOUR HÔTE : VM {} {} → {} vCPUs | reste: {}", emp_id, vcpus_emp, new_emp, reste
                     ));
                 } else {
-                    logger::log_message(&format!("❌ Échec retour hôte VM {}", emp_id));
+                    logger::log_message(&format!(
+                        "↩️  RETOUR OK : VM {} {} → {} vCPUs → VM {} | reste: {}", emp_id, vcpus_emp, new_emp, pret_id, reste
+                    ));
                 }
             } else {
-                // Prêt VM→VM : rendre à la prêteuse
-                let vcpus_pret   = *vcpus_m.get(&pret_id).unwrap_or(&0);
-                let profile_pret = match profiles.get(&pret_id) {
-                    Some(p) => p,
-                    None    => {
-                        // Prêteuse absente — libérer quand même
-                        if set_vm_vcpus(emp_id, new_emp).is_some() {
-                            vcpus_m.insert(emp_id, new_emp);
-                            if let Some(l) = loans.get_mut(&emp_id) {
-                                l.nb_empruntes -= 1;
-                                if l.nb_empruntes == 0 { loans.remove(&emp_id); }
-                            }
-                            vm_states.get_mut(&emp_id).unwrap().low_counter = 0;
-                            logger::log_message(&format!(
-                                "↩️  RETOUR (VM {} absente) : VM {} {} → {} vCPUs",
-                                pret_id, emp_id, vcpus_emp, new_emp
-                            ));
-                        }
-                        continue;
-                    }
-                };
-
-                let new_pret         = vcpus_pret + 1;
-                let rendre_a_preteur = new_pret <= profile_pret.max;
-
-                let ok_emp  = set_vm_vcpus(emp_id, new_emp).is_some();
-                let ok_pret = if rendre_a_preteur {
-                    set_vm_vcpus(pret_id, new_pret).is_some()
-                } else { true };
-
-                if ok_emp && ok_pret {
-                    vcpus_m.insert(emp_id, new_emp);
-                    if rendre_a_preteur { vcpus_m.insert(pret_id, new_pret); }
-                    if let Some(l) = loans.get_mut(&emp_id) {
-                        l.nb_empruntes -= 1;
-                        if l.nb_empruntes == 0 { loans.remove(&emp_id); }
-                    }
-                    vm_states.get_mut(&emp_id).unwrap().low_counter = 0;
-                    let reste = loans.get(&emp_id).map(|l| l.nb_empruntes).unwrap_or(0);
-                    if rendre_a_preteur {
-                        logger::log_message(&format!(
-                            "↩️  RETOUR OK : VM {} ({} → {} vCPUs) → VM {} ({} → {} vCPUs) | reste: {}",
-                            emp_id, vcpus_emp, new_emp, pret_id, vcpus_pret, new_pret, reste
-                        ));
-                    } else {
-                        logger::log_message(&format!(
-                            "↩️  RETOUR OK : VM {} ({} → {} vCPUs) — VM {} au max | reste: {}",
-                            emp_id, vcpus_emp, new_emp, pret_id, reste
-                        ));
-                    }
-                } else {
-                    if ok_emp && !ok_pret { let _ = set_vm_vcpus(emp_id, vcpus_emp); }
-                    logger::log_message(&format!("❌ Échec retour VM {} → VM {}", emp_id, pret_id));
-                }
+                logger::log_message(&format!("❌ Échec retour VM {}", emp_id));
             }
         }
 
-        // ── 5 : Prêts — multi-détresse triée par urgence ─────────────────────
+        // ── 5 : Prêts ─────────────────────────────────────────────────────────
         let mut distress: Vec<(u32, f64)> = vm_avg.iter()
             .filter(|(&vmid, &avg)| {
-                let p     = &profiles[&vmid];
-                let vcpus = *vcpus_m.get(&vmid).unwrap_or(&p.min);
-                let ticks = vm_states[&vmid].distress_counter as usize;
-                // Contrainte hardware : vcpus doit rester <= cores configurés
+                let p         = &profiles[&vmid];
+                let vcpus     = *vcpus_m.get(&vmid).unwrap_or(&p.min);
+                let ticks     = vm_states[&vmid].distress_counter as usize;
                 let cores_max = get_vm_cores_max(vmid);
                 avg >= config.seuil_detresse
                     && vcpus < p.max
-                    && vcpus < cores_max   // ← vérification hardware
+                    && vcpus < cores_max
                     && ticks >= config.duree_avant_action
             })
             .map(|(&id, &avg)| (id, avg))
@@ -319,20 +286,20 @@ pub fn run(config: AppConfig) {
 
         if distress.len() > 1 {
             logger::log_message(&format!(
-                "⚠️  {} VMs en détresse simultanée — traitement par urgence", distress.len()
+                "⚠️  {} VMs en détresse simultanée", distress.len()
             ));
         }
 
         for (dist_id, dist_avg) in &distress {
-            let profile_d  = &profiles[dist_id];
-            let vcpus_d    = *vcpus_m.get(dist_id).unwrap();
-            let cores_max  = get_vm_cores_max(*dist_id);
-            let new_dist   = vcpus_d + 1;
+            let profile_d = &profiles[dist_id];
+            let vcpus_d   = *vcpus_m.get(dist_id).unwrap();
+            let cores_max = get_vm_cores_max(*dist_id);
+            let new_dist  = vcpus_d + 1;
 
             if vcpus_d >= profile_d.max || vcpus_d >= cores_max {
                 logger::log_message(&format!(
-                    "⚠️  VM {} au plafond ({}/{} vCPUs) — surcharge acceptée",
-                    dist_id, vcpus_d, profile_d.max.min(cores_max)
+                    "⚠️  VM {} au plafond ({} vCPUs) — surcharge acceptée",
+                    dist_id, vcpus_d
                 ));
                 continue;
             }
@@ -345,7 +312,6 @@ pub fn run(config: AppConfig) {
                     let avg    = vm_avg.get(&id).copied().unwrap_or(1.0);
                     let ticks  = vm_states.get(&id).map(|s| s.low_counter as usize).unwrap_or(0);
                     let loaned = loans.get(&id).map(|l| l.nb_empruntes).unwrap_or(0);
-                    // Ne pas emprunter à une VM qui a elle-même emprunté
                     vcpus > p.min
                         && avg <= config.seuil_donneuse
                         && ticks >= config.duree_avant_action
@@ -363,7 +329,8 @@ pub fn run(config: AppConfig) {
 
                 logger::log_message(&format!(
                     "🔄 PRÊT : VM {} ({:.0}%, {} vCPUs) → VM {} ({:.0}%, {} vCPUs)",
-                    don_id, don_avg * 100.0, vcpus_don, dist_id, dist_avg * 100.0, vcpus_d
+                    don_id, don_avg * 100.0, vcpus_don,
+                    dist_id, dist_avg * 100.0, vcpus_d
                 ));
 
                 let ok_don  = set_vm_vcpus(don_id, vcpus_don - 1).is_some();
@@ -373,15 +340,13 @@ pub fn run(config: AppConfig) {
                     vcpus_m.insert(don_id, vcpus_don - 1);
                     vcpus_m.insert(*dist_id, new_dist);
 
-                    // Mémoriser l'état initial seulement au premier prêt
+                    // Mémoriser l'état initial au PREMIER prêt uniquement
                     let vcpus_initial = loans.get(dist_id)
                         .map(|l| l.vcpus_initial)
-                        .unwrap_or(vcpus_d); // état avant CE prêt
+                        .unwrap_or(vcpus_d);
 
                     let loan = loans.entry(*dist_id).or_insert(Loan {
-                        preteur_id:    don_id,
-                        nb_empruntes:  0,
-                        vcpus_initial,
+                        preteur_id: don_id, nb_empruntes: 0, vcpus_initial,
                     });
                     loan.nb_empruntes += 1;
 
@@ -389,10 +354,10 @@ pub fn run(config: AppConfig) {
                     vm_states.get_mut(dist_id).unwrap().distress_counter   = 0;
 
                     logger::log_message(&format!(
-                        "✅ PRÊT OK : VM {} → {} vCPUs | VM {} → {} vCPUs | VM {} doit {} à VM {} (initial: {})",
-                        don_id, vcpus_don - 1, dist_id, new_dist,
-                        dist_id, loans[dist_id].nb_empruntes, don_id,
-                        loans[dist_id].vcpus_initial
+                        "✅ PRÊT OK : VM {} → {} vCPUs | VM {} → {} vCPUs | retour cible VM {}: {} vCPUs",
+                        don_id, vcpus_don - 1,
+                        dist_id, new_dist,
+                        dist_id, loans[dist_id].vcpus_initial
                     ));
                 } else {
                     if ok_don && !ok_dist { let _ = set_vm_vcpus(don_id, vcpus_don); }
@@ -400,16 +365,15 @@ pub fn run(config: AppConfig) {
                 }
 
             } else {
-                // Pas de donneur VM → overcommit hôte si activé
+                // Overcommit hôte si activé et hardware le permet
                 let host   = get_host_cpus();
                 let total: u32 = vcpus_m.values().sum();
                 let max_hw = (host as f64 * config.cpu_overcommit_ratio) as u32;
 
-                // Vérification hardware
                 if new_dist > cores_max {
                     logger::log_message(&format!(
-                        "⚠️  VM {} : cores={} insuffisant pour {} vCPUs — ajustez cores dans Proxmox",
-                        dist_id, cores_max, new_dist
+                        "⚠️  VM {} : cores={} insuffisant — augmentez cores dans Proxmox",
+                        dist_id, cores_max
                     ));
                     continue;
                 }
@@ -422,29 +386,28 @@ pub fn run(config: AppConfig) {
                     if set_vm_vcpus(*dist_id, new_dist).is_some() {
                         vcpus_m.insert(*dist_id, new_dist);
                         let vcpus_initial = loans.get(dist_id)
-                            .map(|l| l.vcpus_initial)
-                            .unwrap_or(vcpus_d);
+                            .map(|l| l.vcpus_initial).unwrap_or(vcpus_d);
                         let loan = loans.entry(*dist_id).or_insert(Loan {
                             preteur_id: 0, nb_empruntes: 0, vcpus_initial,
                         });
                         loan.nb_empruntes += 1;
                         vm_states.get_mut(dist_id).unwrap().distress_counter = 0;
                         logger::log_message(&format!(
-                            "✅ PRÊT HÔTE OK : VM {} → {} vCPUs | doit rendre {} à l'hôte",
-                            dist_id, new_dist, loans[dist_id].nb_empruntes
+                            "✅ PRÊT HÔTE OK : VM {} → {} vCPUs | retour cible: {} vCPUs",
+                            dist_id, new_dist, loans[dist_id].vcpus_initial
                         ));
                     } else {
                         logger::log_message(&format!("❌ Échec prêt hôte VM {}", dist_id));
                     }
                 } else {
                     logger::log_message(&format!(
-                        "⚠️  VM {} en détresse ({:.0}%) — aucun donneur disponible, surcharge acceptée",
+                        "⚠️  VM {} en détresse ({:.0}%) — aucun donneur, surcharge acceptée",
                         dist_id, dist_avg * 100.0
                     ));
                 }
             }
         }
 
-        thread::sleep(Duration::from_secs(config.check_interval));
+        thread::sleep(Duration::from_millis(400));
     }
 }
