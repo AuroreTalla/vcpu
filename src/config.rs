@@ -21,8 +21,15 @@ pub struct AppConfig {
     pub seuil_donneuse: f64,
     #[serde(default = "default_duree")]
     pub duree_avant_action: usize,
+    #[serde(default = "default_migration_cooldown")]
+    pub migration_cooldown_seconds: u64,
+
+    #[serde(default = "default_distress_before_mig")]
+    pub distress_before_migration: usize, 
 }
 
+fn default_migration_cooldown() -> u64 { 100 }     // 5 minutes
+fn default_distress_before_mig() -> usize { 4 }    
 fn default_ratio()    -> f64   { 1.0 }
 fn default_detresse() -> f64   { 0.90 }
 fn default_donneuse() -> f64   { 0.30 }
