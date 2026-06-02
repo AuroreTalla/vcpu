@@ -27,7 +27,7 @@ pub fn send_migrate_vm(vmid: u32, reason: String, urgency: Urgency) -> bool {
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs();
+        .as_millis();
 
     let filename = format!("signal_{}_migrate_vm.sig", ts);
     let tmp_path = format!("{}/{}.tmp", SIGNALS_DIR, filename);
@@ -52,20 +52,37 @@ pub fn send_migrate_vm(vmid: u32, reason: String, urgency: Urgency) -> bool {
     }
 
     match File::create(&tmp_path).and_then(|mut f| f.write_all(content.as_bytes())) {
-        Ok(_) => {
-            if fs::rename(&tmp_path, &final_path).is_ok() {
+    Ok(_) => {
+        match fs::rename(&tmp_path, &final_path) {
+            Ok(_) => {
                 crate::logger::log_message(&format!(
-                    "📤 SIGNAL → MIGRATE_VM VM{} | {} | urgency={}", 
+                    "📤 SIGNAL → MIGRATE_VM VM{} | {} | urgency={}",
                     vmid, reason, urgency.as_str()
                 ));
                 return true;
             }
-        }
-        Err(e) => {
-            let _ = fs::remove_file(&tmp_path);
-            crate::logger::log_message(&format!("❌ [signals] Échec écriture: {}", e));
+
+            Err(e) => {
+                let _ = fs::remove_file(&tmp_path);
+
+                crate::logger::log_message(&format!(
+                    "❌ [signals] Rename impossible: {}",
+                    e
+                ));
+            }
         }
     }
+
+    Err(e) => {
+        let _ = fs::remove_file(&tmp_path);
+
+        crate::logger::log_message(&format!(
+            "❌ [signals] Échec écriture: {}",
+            e
+        ));
+    }
+    }
+
     false
 }
 
@@ -73,7 +90,7 @@ pub fn send_lighten_node(reason: String, urgency: Urgency) -> bool {
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs();
+        .as_millis();
     let filename  = format!("signal_{}_lighten_node.sig", ts);
     let tmp_path  = format!("{}/{}.tmp", SIGNALS_DIR, filename);
     let final_path = format!("{}/{}", SIGNALS_DIR, filename);
@@ -93,18 +110,36 @@ pub fn send_lighten_node(reason: String, urgency: Urgency) -> bool {
         return false;
     }
     match File::create(&tmp_path).and_then(|mut f| f.write_all(content.as_bytes())) {
-        Ok(_) => {
-            if fs::rename(&tmp_path, &final_path).is_ok() {
+    Ok(_) => {
+        match fs::rename(&tmp_path, &final_path) {
+            Ok(_) => {
                 crate::logger::log_message(&format!(
-                    "📤 SIGNAL → LIGHTEN_NODE | {} | urgency={}", reason, urgency.as_str()
+                    "📤 SIGNAL → LIGHTEN_NODE | {} | urgency={}",
+                    reason,
+                    urgency.as_str()
                 ));
                 return true;
             }
-        }
-        Err(e) => {
-            let _ = fs::remove_file(&tmp_path);
-            crate::logger::log_message(&format!("❌ [signals] Échec: {}", e));
+
+            Err(e) => {
+                let _ = fs::remove_file(&tmp_path);
+
+                crate::logger::log_message(&format!(
+                    "❌ [signals] Rename impossible: {}",
+                    e
+                ));
+            }
         }
     }
+
+    Err(e) => {
+        let _ = fs::remove_file(&tmp_path);
+
+        crate::logger::log_message(&format!(
+            "❌ [signals] Échec écriture: {}",
+            e
+        ));
+    }
+}
     false
 }

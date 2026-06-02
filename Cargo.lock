@@ -8,6 +8,7 @@ version = "1.0.0"
 dependencies = [
  "chrono",
  "lazy_static",
+ "once_cell",
  "regex",
  "serde",
  "serde_json",
